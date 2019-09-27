@@ -1,0 +1,6 @@
+# filter ide file
+.idea/
+.vscode/
+
+# filter pycache
+__pycache__/
