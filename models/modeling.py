@@ -11,6 +11,7 @@ from utils.misc import ensure_path
 
 from .mini_resnet import get_network
 from .mini_resnet import get_network_outputs_dim
+from .model_utils import WeightGenerator
 
 __all__ = ['MetaTransformLearner']
 
@@ -277,4 +278,77 @@ class MetaTransformLearner(_FewShotLearner):
             grad = torch.autograd.grad(loss_shot, new_weights)
             new_weights = list(map(lambda p: p[1] - fast_lr * p[0], zip(grad, new_weights)))
         logits_query = self.meta_classifier(embedding_query, new_weights)
+        return logits_query
+
+
+class WithoutForgettingLearner(_FewShotLearner):
+    def __init__(self, args, num_cls=64, hidden_dim=1000):
+        super(WithoutForgettingLearner, self).__init__(args, hidden_dim=hidden_dim, num_cls=num_cls)
+        self.allow_phases = ['pretrain', 'meta_train', 'preval', 'meta_eval']
+        assert self.phase in self.allow_phases, 'found unexpected phase `%s`' % self.phase
+
+        self.hidden_dim = hidden_dim
+        # weight generator instance
+        self.weight_generator = WeightGenerator(base_cls=num_cls,
+                                                # FIXME: There is `self.way_pre` above,
+                                                #  but seems like it is undeclared
+                                                way=self.way_pre,
+                                                hidden_dim=hidden_dim)
+
+        # 2 cases
+        # we need to load the best pretrain model first
+        # (1) first time we meta train the model
+        # (2) preval the model
+        if (self.phase == 'meta_train' and not self.resume_meta) or self.phase == 'preval':
+            self.load_pretrained_model(load_best=True)
+
+        # 1 cases
+        # we need to load the latest pretrain model first
+        # (1) resume to pretrain the model
+        if self.phase == 'pretrain' and self.resume_pre:
+            self.load_pretrained_model(load_best=False)
+
+        # 1 cases
+        # we need to load the latest meta-train model first
+        # (1) resume to meta-train the model
+        if self.phase == 'meta-train' and self.resume_meta:
+            self.load_pretrained_model(load_best=False)
+
+        # 1 cases
+        # we need to load the best meta train model
+        # (1) meta-eval the model
+        if self.phase == 'meta_eval':
+            self.load_meta_model(load_best=True)
+
+    def forward(self, *input):
+        if self.phase == 'pretrain':
+            return self.pretrain_forward(*input)
+        if self.phase == 'preval':
+            return self.meta_forward(*input)
+        if self.phase == 'meta_train':
+            return self.meta_forward(input)
+        if self.phase == 'meta_eval':
+            return self.meta_forward(input)
+
+    def set_phase(self, phase):
+        self.allow_phases = ['pretrain', 'preval', 'meta_train', 'meta_eval']
+        assert phase in self.allow_phases, 'found unexpected phase `%s`' % phase
+        self.phase = phase
+        if self.phase == 'pretrain' or self.phase == 'meta_train':
+            self.train()
+        else:
+            self.eval()
+
+    def pretrain_forward(self, input):
+        return self.pre_classifier(self.basenet(input))
+
+    def meta_forward(self, *input):
+        data_shot, label_shot, data_query = input
+        embedding_query = self.basenet(data_query)
+        embedding_shot = self.basenet(data_shot)
+
+        base_weight = self.pre_classifier[-1].weight.data
+        novel_weight = self.weight_generator.get_novel_weight(embedding_shot, base_weight)
+        self.meta_classifier.weight.data = novel_weight
+        logits_query = self.meta_classifier(embedding_query)
         return logits_query
